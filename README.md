@@ -18,5 +18,3 @@ This repository contains an R-based forecasting model for malaria deaths using I
 2. Run locally: `Rscript isolated_run.r`
 3. For Chap: Follow Chap documentation to evaluate the model. Uses docker image with INLA pre-installed.
 
-Note: The model assumes input data has columns: time_period, rainfall, mean_temperature, disease_cases (for train), location, population.
-Lagged features are computed internally. Fitting occurs in predict.r by appending future data.
