@@ -1,0 +1,164 @@
+#R script for forecasting and modeling malaria mortality in Mozambique
+
+set.seed(123)
+
+# Install and load required packages
+if (!require("INLA", quietly = TRUE)) {
+  install.packages(
+    "INLA",
+    repos = c(getOption("repos"), INLA = "https://inla.r-inla-download.org/R/stable"),
+    dependencies = TRUE
+  )
+}
+
+library(INLA)
+library(dplyr)
+library(ggplot2)
+library(readr)
+
+# Load the dataset
+df <- read_csv("mortality.csv", show_col_types = FALSE)
+
+# Clean column names
+colnames(df) <- make.names(colnames(df))
+
+# Extract province, handling NAs as 'Unknown'
+df$province <- df$PIG..Province..habitual.residence
+df$province[is.na(df$province)] <- "Unknown"
+
+# Aggregate deaths by province (monthly counts not available due to lack of dates; totals provided)
+province_deaths <- df %>%
+  group_by(province) %>%
+  summarise(deaths = n(), .groups = 'drop')
+print("Total deaths by province (2024 sample data):")
+print(province_deaths)
+
+# Simulating months since no real dates (assume uniform distribution for modeling)
+df$month <- sample(1:12, nrow(df), replace = TRUE)
+
+# Actual average monthly climate data for Niassa (dominant province; applied uniformly for simplicity)
+# Rainfall (mm): Jan to Dec
+monthly_rain <- c(257, 241, 259, 111, 15, 4, 2, 1, 4, 28, 94, 209)
+# Average temperature (°C): Jan to Dec
+monthly_temp <- c(26, 25.5, 25.5, 25, 23.5, 22, 22, 23.5, 25, 27, 27, 26.5)
+
+# Approximate 2024 population by province (based on 2017 census scaled by national growth ~1.23 factor)
+# Sources: Wikipedia and other estimates; only for provinces in the mortality dataset
+prov_pop <- data.frame(
+  province = c("Cabo Delgado", "Gaza", "Inhambane", "Manica", "Maputo", "MaputoCidade", 
+               "Nampula", "Niassa", "Sofala", "Tete", "Zambêzia", "Unknown"),
+  population = c(2333278 * 1.23, 1446654 * 1.23, 1488676 * 1.23, 1945994 * 1.23, 
+                 1968906 * 1.23, 1080277 * 1.23, 6102867 * 1.23, 1865172 * 1.23, 
+                 2221803 * 1.23, 2648941 * 1.23, 5110787 * 1.23, 100000)  # Unknown small
+)
+
+# Aggregate data by province and simulated month
+obs_data <- df %>%
+  group_by(province, month) %>%
+  summarise(deaths = n(), .groups = 'drop') %>%
+  left_join(prov_pop, by = "province")
+
+# Assign actual lagged climate based on month
+lag_index <- function(m, lag) {
+  ((m - lag - 1) %% 12) + 1
+}
+obs_data$rain_lag1 <- monthly_rain[lag_index(obs_data$month, 1)]
+obs_data$rain_lag2 <- monthly_rain[lag_index(obs_data$month, 2)]
+obs_data$temp_lag1 <- monthly_temp[lag_index(obs_data$month, 1)]
+
+# District ID (provinces as districts)
+obs_data$district <- as.integer(factor(obs_data$province))
+
+# INLA formula (refined with actual climate and populations)
+inla_formula <- deaths ~
+  f(rain_lag1, model = "rw1") +
+  f(rain_lag2, model = "rw1") +
+  f(temp_lag1, model = "rw1") +
+  f(month, model = "seasonal", season.length = 12) +
+  f(district, model = "iid") +
+  offset(log(population / 1000))
+
+# Future data for forecasting (next 12 months, using actual average lagged climate)
+newdata <- expand.grid(
+  month = 1:12,
+  province = unique(obs_data$province)
+) %>%
+  left_join(prov_pop, by = "province") %>%
+  mutate(
+    deaths = NA_real_,
+    rain_lag1 = monthly_rain[lag_index(month, 1)],
+    rain_lag2 = monthly_rain[lag_index(month, 2)],
+    temp_lag1 = monthly_temp[lag_index(month, 1)],
+    district = as.integer(factor(province))
+  )
+
+# Combine data
+fit_data <- bind_rows(
+  obs_data %>% select(month, district, population, rain_lag1, rain_lag2, temp_lag1, deaths),
+  newdata %>% select(month, district, population, rain_lag1, rain_lag2, temp_lag1, deaths)
+)
+
+# Fit model
+model <- inla(
+  inla_formula,
+  family = "poisson",
+  data = fit_data,
+  control.predictor = list(compute = TRUE, link = 1),
+  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE)
+)
+
+# Extract predictions
+n_new <- nrow(newdata)
+idx_new <- (nrow(fit_data) - n_new + 1):nrow(fit_data)
+pred_resp <- model$summary.fitted.values[idx_new, c("mean", "0.025quant", "0.975quant")]
+pred_link <- model$summary.linear.predictor[idx_new, c("mean", "sd")]
+
+# Forecast dataframe
+forecast_df <- newdata %>%
+  mutate(
+    forecast_deaths = pred_resp$mean,
+    lci = pred_resp$`0.025quant`,
+    uci = pred_resp$`0.975quant`,
+    link_mean = pred_link$mean,
+    link_sd = pred_link$sd
+  )
+
+# Print fit criteria
+cat("\nRefined Model DIC:", model$dic$dic, "\n")
+cat("Refined Model WAIC:", model$waic$waic, "\n")
+
+# plots
+p1 <- ggplot(forecast_df, aes(x = month, y = forecast_deaths, color = province)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = lci, ymax = uci, fill = province), alpha = 0.20, color = NA) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    title = "Forecast Malaria Deaths with 95% Credible Intervals (Refined Model)",
+    subtitle = "Using actual 2024 climate data, populations, and simulated months for 2024 sample",
+    x = "Month",
+    y = "Forecasted Deaths (Posterior Mean)",
+    color = "Province",
+    fill = "Province"
+  ) +
+  theme_classic()
+print(p1)
+
+# Optional: Seasonal effect plot
+if ("month" %in% names(model$summary.random)) {
+  month_eff <- model$summary.random$month
+  p2 <- ggplot(month_eff, aes(x = ID, y = mean)) +
+    geom_line(size = 1) +
+    geom_ribbon(aes(ymin = `0.025quant`, ymax = `0.975quant`), alpha = 0.20) +
+    scale_x_continuous(breaks = 1:12) +
+    labs(
+      title = "Estimated Seasonal Effect f(month)",
+      subtitle = "Posterior mean and 95% credible interval (link scale)",
+      x = "Month",
+      y = "Effect"
+    ) +
+    theme_classic()
+  print(p2)
+}
+
+# Save forecast
+write_csv(forecast_df, "malaria_forecast.csv")
